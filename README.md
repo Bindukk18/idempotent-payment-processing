@@ -1,87 +1,94 @@
 # Idempotent Payment Processing
 
-A distributed-systems lab: payment retries must not charge twice.
+A Spring Boot engineering lab exploring DB-backed idempotency,
+concurrent retries, deterministic response replay, and the
+unavoidable crash window around external payment side effects.
 
 ## Problem
 
-Clients retry payment requests because of:
+Clients retry `POST /payments` after timeouts, gateway retries, user double-submit,
+or a crash mid-request.
 
-- network timeouts
-- gateway retries
-- user retries
-- client crashes
+Without a durable ownership record, each retry can call the payment provider
+again and charge the customer twice.
 
-Without idempotency:
-
-```text
-retry
-   -> another payment
-   -> customer may be charged twice
-```
-
-## Solution
-
-```text
-Idempotency-Key
-      +
-request fingerprint
-      +
-database uniqueness
-      +
-persisted response
-```
-
-The database uniqueness constraint on `idempotency_key` is the lock. Not a
-`ConcurrentHashMap`, not `synchronized`, not “check then insert” in Java.
+`ConcurrentHashMap` / `synchronized` only protect one JVM. The same
+`Idempotency-Key` can arrive on another replica after a restart or load-balancer
+retry. In this lab, ownership is enforced through a PostgreSQL uniqueness
+constraint, so it survives process restarts and works across service replicas.
 
 ## Architecture
 
-![Idempotent payment processing v0.1 architecture](docs/assets/idempotent-payment-architecture.png)
+![Idempotent Payment Processing Architecture](docs/architecture.png)
+
+The lock is `PRIMARY KEY (idempotency_key)` on `idempotency_records`.
+
+TX1 inserts `PROCESSING` and **commits**. The fake provider is called **outside**
+any database transaction. On provider success, TX2 persists the payment,
+serialized HTTP response, and marks the idempotency record `COMPLETED`. On a
+definite provider failure, TX2 stores the failure response and marks the
+idempotency record `FAILED`.
 
 HTTP **425** `IDEMPOTENCY_KEY_IN_PROGRESS` is an API design choice: a concurrent
-retry while the winner is still `PROCESSING` must not look like a completed
-charge.
+loser must not receive a fabricated 201 while the winner is still in the
+provider call.
 
-## Flow
+Implementation detail (fingerprint, 23505 reread after rollback, persist vs
+merge): [docs/DESIGN.md](docs/DESIGN.md).
+
+## Core guarantees
+
+Demonstrated in this lab (PostgreSQL uniqueness, not an in-memory map):
+
+- one ownership winner for the same `Idempotency-Key`
+- provider called once for concurrent same-key requests
+- deterministic replay of the stored HTTP status and body after `COMPLETED` / `FAILED`
+- same key + different fingerprinted request → **409** `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST`
+- concurrent insert collisions are PostgreSQL `23505`, then a reread in a **new** transaction
+
+Explicitly **not** guaranteed:
+
+- exactly-once semantics across arbitrary external systems
+- recovery if the process dies while the row is still `PROCESSING`
+- reconciliation against the provider
+- a `PROCESSING` lease or sweeper
+- a real payment gateway (fake provider only)
+- distributed messaging
+
+## Crash window
 
 ```text
-Request
-   |
-   v
-Idempotency-Key
-   |
-   v
-Fingerprint request
-   |
-   v
-Attempt DB claim
-   |
-   +---- existing key + different fingerprint ---> 409
-   |
-   +---- existing COMPLETED / FAILED ------------> replay stored response
-   |
-   +---- existing PROCESSING ---------------------> 425 PROCESSING
-   |
-   +---- new key
-             |
-             v
-         PROCESSING   (transaction 1 commits)
-             |
-             v
-       Fake Provider  (no DB transaction held)
-             |
-             v
-      persist response
-             |
-             v
-         COMPLETED    (transaction 2 commits)
+TX1 commits PROCESSING
+     ↓
+provider succeeds
+     ↓
+<<< process may crash here >>>
+     ↓
+TX2 persists payment + COMPLETED
 ```
 
-v0.1 hypotheses for this lab: the fake provider is called **only** by the
-request that successfully inserted `PROCESSING`. Concurrent losers re-read
-the row and must not invoke the provider.
+If the process dies in that window, the local row stays `PROCESSING` and the
+external charge may already have happened. Local state alone cannot tell which
+is true.
 
-## Example
+In a production integration, provider-side idempotency can prevent a retry
+from creating a second external charge. This lab forwards the same
+`Idempotency-Key` to the fake provider to demonstrate propagation of that
+contract; forwarding the key does not by itself make a provider idempotent.
+Reconciliation solves the separate problem of determining whether the external
+side effect actually happened when local state is uncertain. v0.1 does not
+claim exactly-once semantics.
+
+## Quick Start
+
+Requires Java 21. Tests and `spring-boot:run` start embedded PostgreSQL
+(not H2).
+
+```bash
+java -version
+./mvnw test
+./mvnw spring-boot:run
+```
 
 ```bash
 curl -sS -D - http://localhost:8080/payments \
@@ -90,114 +97,7 @@ curl -sS -D - http://localhost:8080/payments \
   -d '{"customerId":"cust-123","amount":2500,"currency":"INR"}'
 ```
 
-First call: HTTP 201, a `paymentId`, provider counter +1.
-
-Same key and body: HTTP 201, **same** `paymentId`, provider counter unchanged.
-
-Same key, different `amount`: HTTP 409 `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST`.
-
-Concurrent same key while the first call is still `PROCESSING`: HTTP 425
-`IDEMPOTENCY_KEY_IN_PROGRESS`. Retry after completion to replay the stored
-body.
-
-## Quick Start
-
-Java 21. Embedded PostgreSQL starts with the app (no Docker required for tests).
-
-```bash
-export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
-export PATH="$JAVA_HOME/bin:$PATH"
-
-./mvnw test
-./mvnw spring-boot:run
-```
-
-## Transaction boundaries
-
-**Transaction 1:** insert `idempotency_records` in `PROCESSING`, **COMMIT**.
-
-**External:** call the fake payment provider. No database transaction is open.
-
-**Transaction 2:** insert `payments`, store HTTP status + response body, set
-`COMPLETED` or `FAILED`, **COMMIT**.
-
-Holding a DB transaction or row lock across an external call is dangerous:
-long-running locks, connection-pool exhaustion, poor throughput, extra
-deadlock risk, and unbounded wait on network latency.
-
-## Database uniqueness and concurrency
-
-Ownership is `PRIMARY KEY (idempotency_key)`.
-
-Concurrent inserts of the same key: exactly one insert commits. The others
-fail the uniqueness constraint, re-read the winner, and never call the
-provider.
-
-A JVM lock or `ConcurrentHashMap` only protects one process:
-
-```text
-Client
-   |
-Load Balancer
-  / \
-Pod A   Pod B
-Map A   Map B
-```
-
-The same `Idempotency-Key` can land on both pods. Restarts, reschedules, and
-deployments drop in-memory maps. Durable shared storage + a uniqueness
-constraint are required.
-
-## Request fingerprint
-
-SHA-256 of canonical DTO fields (`customerId`, `amount`, `currency`) joined
-with a stable separator. Not a JSON string: field order and whitespace would
-make the same logical payment look like a different request (false 409) or
-collapse different payments into one (false replay).
-
-## Crash window (not solved)
-
-1. Service stores `PROCESSING`
-2. Calls provider
-3. Provider charges the customer
-4. Process crashes
-5. `COMPLETED` was never persisted
-
-The local table cannot prove whether the external side effect happened.
-A real payment system also needs **provider-side idempotency keys**,
-**reconciliation**, or **durable workflow / outbox** coordination.
-
-This lab forwards the same `Idempotency-Key` into the fake provider to show
-that pattern. It does **not** implement exactly-once delivery to arbitrary
-external systems.
-
-## State machine
-
-```text
-new key
-   |
-   v
-PROCESSING
-   |
-   +---- provider success ----> COMPLETED
-   |
-   +---- definite provider failure ----> FAILED
-```
-
-No lease, no stale-PROCESSING sweeper, no automatic retry of `FAILED` in v0.1.
-Replay of `COMPLETED` / `FAILED` returns the stored HTTP status and body.
-
-## Limitations
-
-- Fake provider only; no real payment gateway
-- No distributed messaging
-- No reconciliation worker
-- No stale `PROCESSING` recovery / lease
-- No production authentication
-- No exactly-once guarantee across arbitrary external systems
-- Embedded PostgreSQL for the lab, not a production cluster
-- Small educational lab, not a payment platform
-
-## Design notes
-
-[docs/DESIGN.md](docs/DESIGN.md)
+First request: **201**, a `paymentId`, provider counter +1. Same key and
+fingerprinted fields: **201**, same `paymentId`, counter unchanged. Same key,
+different fingerprinted request: **409**. Concurrent same key during
+`PROCESSING`: **425**, then retry for replay.
